@@ -1,13 +1,18 @@
 # app_dragdrop_excel_reports.py
-# 変更点: (1) PDF関連コードの完全削除 (2) ボタン文言/タイトルUIの簡素化
-# 強化: (A) ヘッダ検出で「払出数」を数量より優先 (B) LOT抽出で「Lot.」も許可
-#       (C) 行キャリー＋集約ロジックに「シリアルのみぶら下がり＆Lot No.空」の特例対応
-#       (D) 新しい型番ブロック開始時に last_lotno / last_exp_norm を確実にリセット（誤キャリー防止）
+# 変更点:
+# (1) PDF関連コードの完全削除
+# (2) ボタン文言/タイトルUIの簡素化
+# 強化:
+#   (A) ヘッダ検出で「払出数」を数量より優先
+#   (B) LOT抽出で「Lot.」も許可
+#   (C) 行キャリー＋集約ロジックに「シリアルのみぶら下がり＆Lot No.空」の特例対応
+#   (D) 新しい型番ブロック開始時に last_lotno / last_exp_norm を確実にリセット（誤キャリー防止）
+#   (E) シート選択: 編集用 > 最初に見つかった数量シート > 日付シート > その他
 # ------------------------------------------------------------
 # pip install streamlit pandas openpyxl requests
 # 実行: streamlit run app_dragdrop_excel_reports.py
 # ------------------------------------------------------------
-import io, os, re, time, datetime as dt
+import io, re, time, datetime as dt
 from typing import List, Tuple, Optional, Dict, Any
 
 import streamlit as st
@@ -43,7 +48,6 @@ def autosize(ws):
             max_len = max(max_len, len(val))
         ws.column_dimensions[letter].width = min(max_len + 2, 80)
 
-# 数量の強化正規化：数値型/小数/カンマ/全角/単位付きもOK
 def _to_int_qty(q) -> Optional[int]:
     if q is None or (isinstance(q, float) and pd.isna(q)):
         return None
@@ -59,15 +63,13 @@ def _to_int_qty(q) -> Optional[int]:
     except Exception:
         return None
 
-# NEW: ファイル名から「返庫」判定（Excelにのみ適用）
 def is_henko_from_name(filename_wo_ext: str) -> bool:
     return "返庫" in (filename_wo_ext or "")
 
-# ===================== Excelヘッダ検出（2段対応） =====================
+# ===================== Excelヘッダ検出 =====================
 HEADER_KEYS = {
     "model": ["型番","品目","品番","型 式"],
     "lotno": ["Lot No","LotNo","LOT NO","ロット","Lot"],
-    # qty は「払出数系 ＞ 数量系」で優先
     "qty_hi": ["払出数","払い出し","払出","出庫","出数"],
     "qty_lo": ["数量","個数","数"],
     "exp":   ["有効期限","期限","賞味期限","Exp","有効期日"],
@@ -113,22 +115,16 @@ def detect_header(df: pd.DataFrame, scan_rows: int = 40) -> dict|None:
         return {}
 
     scan_rows = min(len(df), scan_rows)
-    # 1段
     for r in range(scan_rows):
         row = [_n(x) for x in df.iloc[r,:].tolist()]
         if not any(row): continue
         hit = hit_from_row(row)
         if hit: return {"row": r, **hit}
-    # 2段（上下マージ）
     for r in range(scan_rows-1):
         row1 = [_n(x) for x in df.iloc[r,:].tolist()]
         row2 = [_n(x) for x in df.iloc[r+1,:].tolist()]
         width = max(len(row1), len(row2))
-        combo=[]
-        for c in range(width):
-            a = row1[c] if c < len(row1) else ""
-            b = row2[c] if c < len(row2) else ""
-            combo.append((a or b) if (a or b) else "")
+        combo=[(row1[c] or row2[c]) if (c<len(row1) or c<len(row2)) else "" for c in range(width)]
         if not any(combo): continue
         hit = hit_from_row(combo)
         if hit: return {"row": r, **hit}
@@ -137,14 +133,12 @@ def detect_header(df: pd.DataFrame, scan_rows: int = 40) -> dict|None:
 def extract_koutei_lot_from_sheet(df: pd.DataFrame, max_scan_rows:int=8, max_scan_cols:int=8) -> Tuple[Optional[str], Optional[str]]:
     koutei=None; lot=None
     rows=min(len(df),max_scan_rows); cols=min(df.shape[1],max_scan_cols)
-    # 工程名（上部の最初の非空セル）
     for r in range(rows):
         for c in range(cols):
             v=_n(df.iat[r,c])
             if v and not re.search(r"\b(lot|ロット)\b", v, flags=re.I):
                 koutei=v; break
         if koutei: break
-    # LOT（Lot: / Lot. / ロット: を許可）
     lot_pat = re.compile(r"(?:\bLot\b\.?|ロット)\s*[：:\.\s]\s*([^\s]+)", re.I)
     for r in range(rows):
         for c in range(cols):
@@ -155,16 +149,35 @@ def extract_koutei_lot_from_sheet(df: pd.DataFrame, max_scan_rows:int=8, max_sca
         if lot: break
     return koutei, lot
 
-# ===================== シート選択（編集用優先・日付優先・確認系除外） =====================
+# ===================== シート選択 =====================
 EXCLUDED_SHEET_PATTERNS = [
     r"基本シート", r"^確認", r"確認用", r"確認\s*\(編集後\)", r"確認\(編集後\)",
     r"チェック", r"Check", r"DL用"
 ]
 DATE_SHEET_RE = re.compile(r"(?:^|\s)(\d{4})[./-](\d{1,2})[./-](\d{1,2})(?:\s|$)")
 
-def choose_target_sheet(sheet_names: list[str]) -> tuple[str, str]:
+def choose_target_sheet(sheet_names: list[str], xbytes: bytes) -> tuple[str, str]:
+    # 1) 編集用
     if "編集用" in sheet_names:
         return "編集用", "編集用が最優先"
+
+    # 2) 数量シート（最初に見つかったもの）
+    for s in sheet_names:
+        if any(re.search(pat, s) for pat in EXCLUDED_SHEET_PATTERNS):
+            continue
+        try:
+            df = pd.read_excel(io.BytesIO(xbytes), sheet_name=s, header=None)
+            hmap = detect_header(df, scan_rows=40)
+            if not hmap: continue
+            qc = hmap.get("qty")
+            if qc is None: continue
+            col_vals = df.iloc[hmap["row"]+1:, qc].dropna().tolist()
+            if any(_to_int_qty(v) not in (None,0) for v in col_vals):
+                return s, "数量シート優先"
+        except Exception:
+            continue
+
+    # 3) 日付シート
     dated: list[tuple[dt.date, str]] = []
     for s in sheet_names:
         m = DATE_SHEET_RE.search(s)
@@ -175,12 +188,18 @@ def choose_target_sheet(sheet_names: list[str]) -> tuple[str, str]:
     if dated:
         dated.sort(reverse=True)
         return dated[0][1], f"日付シート優先（最新={dated[0][0].isoformat()}）"
+
+    # 4) 除外以外の先頭
     for s in sheet_names:
         if any(re.search(pat, s) for pat in EXCLUDED_SHEET_PATTERNS):
             continue
         return s, "除外を除いた先頭シート"
+
+    # 5) フォールバック
     return sheet_names[0], "フォールバック（先頭）"
 
+# ===================== Excel明細抽出（parse_excel_table） =====================
+# （ここから下の parse_excel_table 〜 Streamlit UI も完全に書き出します）
 # ===================== Excel明細抽出（キャリー＋集約＋特例＋境界リセット） =====================
 def parse_excel_table(
     df: pd.DataFrame,
@@ -198,9 +217,7 @@ def parse_excel_table(
     - (model, lotno, exp_norm) 単位で数量を集約（qty_sign適用後）→ 出力。
     - 特例: 「シリアルだけが下にぶら下がり、Lot No.欄が全体で空」のブロックは、
             Lot No.空のまま（許容）で型番行の払出数を1行にまとめて出力。
-            （UIでLot No.必須=ONでもブロック内にLot No.が1つも無ければ許容）
-    - 重要: 新しい“型番”を検知した時点で、last_lotno / last_exp_norm を必ず None にリセットし、
-            前ブロックのLot/期限が誤ってキャリーされるのを防止。
+    - 新しい型番ブロック開始時に last_lotno / last_exp_norm を必ず None にリセット。
     """
     start=header_map["row"]+1
     mc,lc,qc,ec = header_map["model"],header_map["lotno"],header_map["qty"],header_map["exp"]
@@ -221,33 +238,26 @@ def parse_excel_table(
         return s
 
     def has_any_lotno_until_next_model(start_i: int) -> bool:
-        """現在の行以降、次のモデルが出るまでの間にLotNoが1つでもあるか"""
         for j in range(start_i+1, len(sub)):
             rj = sub.iloc[j,:]
             model_j = _str_or_none(_cell(rj, mc))
             lotno_j = _str_or_none(_cell(rj, lc))
-            if model_j:  # 次のブロック開始
-                break
-            if lotno_j:
-                return True
+            if model_j: break
+            if lotno_j: return True
         return False
 
     def lookahead_first_exp(start_i: int) -> Optional[str]:
-        """現在の行を含め、次のモデルが出るまでに最初に見つかった期限を返す"""
         for j in range(start_i, len(sub)):
             rj = sub.iloc[j,:]
             model_j = _str_or_none(_cell(rj, mc))
-            if j > start_i and model_j:  # 次ブロックに入ったら終了
-                break
+            if j > start_i and model_j: break
             expv_j = _str_or_none(_cell(rj, ec))
             exp_norm_j = normalize_date(expv_j) if expv_j else None
-            if exp_norm_j:
-                return exp_norm_j
+            if exp_norm_j: return exp_norm_j
         return None
 
     for i in range(len(sub)):
         row=sub.iloc[i,:]
-
         model_raw=_cell(row, mc)
         lotno_raw=_cell(row, lc)
         qty_raw  =_cell(row, qc)
@@ -259,19 +269,17 @@ def parse_excel_table(
         exp_s = _str_or_none(exp_raw)
         exp_norm = normalize_date(exp_s) if exp_s else None
 
-        # 完全空行
+        # 空行
         if not any([model, lotno, (qty_i is not None), (exp_s is not None and exp_s!="")]):
             stats["空行"] += 1
             continue
 
-        # ★ ブロック境界検知：この行に model があれば新ブロック開始
+        # 新しい型番ブロック開始
         if model:
             last_model = model
-            # 前ブロックのLot/期限はここで確実に捨てる（誤キャリー防止）
             last_lotno = None
             last_exp_norm = None
 
-        # 入力がある項目だけ last_* を更新
         if lotno: last_lotno = lotno
         if exp_norm: last_exp_norm = exp_norm
 
@@ -283,16 +291,13 @@ def parse_excel_table(
             stats["型番欠落"] += 1
             continue
 
-        # 数量チェック
         if qty_i is None:
-            # 期限だけやシリアル行などは既にキャリー済みなのでエラーにしない
             continue
         if qty_i == 0:
             stats["数量=0"] += 1
             continue
         qty_i = abs(qty_i) * qty_sign
 
-        # 期限がこの時点で未確定なら、同ブロック内から先読み
         if require_exp and not cur_exp:
             peek_exp = lookahead_first_exp(i)
             if peek_exp:
@@ -302,13 +307,12 @@ def parse_excel_table(
                 stats["日付不正"] += 1
                 continue
 
-        # Lot No.必須だが、ブロック内にLotNoが1つも無い=シリアルだけの特例は許容
         if require_lotno and not cur_lotno:
             if has_any_lotno_until_next_model(i):
                 stats["LotNo欠落"] += 1
                 continue
             else:
-                cur_lotno = ""  # 特例：空のまま出力
+                cur_lotno = ""
 
         key = (cur_model, cur_lotno or "", cur_exp or "")
         agg[key] = agg.get(key, 0) + qty_i
@@ -460,7 +464,6 @@ def copilot_directline_test(secret: str, test_message: str = "ping") -> tuple[bo
 
 # ===================== Streamlit UI =====================
 st.set_page_config(page_title="Excel抽出ツール", page_icon="🧾", layout="wide")
-# タイトルは表示しない（ユーザー要望）
 
 with st.sidebar:
     st.subheader("Excel抽出の必須項目")
@@ -481,7 +484,7 @@ with st.sidebar:
                 st.error(f"❌ 連携NG：{msg}")
 
 st.markdown("### 1) 入力ファイル（Excel／複数可、★1回につき最大8ファイルまで）")
-xlsx_inputs = st.file_uploader("Excel（シート自動選択：編集用＞最新日付＞その他、確認系は除外）", type=["xlsx"], accept_multiple_files=True)
+xlsx_inputs = st.file_uploader("Excel（シート自動選択：編集用＞数量シート＞最新日付＞その他、確認系は除外）", type=["xlsx"], accept_multiple_files=True)
 
 st.markdown("### 2) 追記先Excel（未指定なら新規作成してDL可）")
 out_book = st.file_uploader("既存Excel（“編集用/品名ごと/工程ごと/品名マスタ”を含む想定）", type=["xlsx"])
@@ -489,7 +492,6 @@ out_book = st.file_uploader("既存Excel（“編集用/品名ごと/工程ご�
 st.markdown("---")
 run = st.button("▶ データ抽出")
 
-# 状態
 if "rows_all" not in st.session_state: st.session_state.rows_all=[]
 if "problems" not in st.session_state: st.session_state.problems=[]
 if "updated_excel_bytes" not in st.session_state: st.session_state.updated_excel_bytes=None
@@ -497,13 +499,12 @@ if "updated_excel_bytes" not in st.session_state: st.session_state.updated_excel
 if run:
     st.session_state.rows_all=[]; st.session_state.problems=[]; st.session_state.updated_excel_bytes=None
 
-    # -------- Excel処理のみ --------
     if xlsx_inputs:
         for xf in xlsx_inputs:
             try:
                 xbytes=xf.read()
                 xls=pd.ExcelFile(io.BytesIO(xbytes))
-                target_sheet, reason = choose_target_sheet(xls.sheet_names)
+                target_sheet, reason = choose_target_sheet(xls.sheet_names, xbytes)
                 df=pd.read_excel(io.BytesIO(xbytes), sheet_name=target_sheet, header=None)
 
                 koutei, lot = extract_koutei_lot_from_sheet(df)
@@ -512,7 +513,6 @@ if run:
                     st.session_state.problems.append(f"{xf.name}: ヘッダ検出失敗（{target_sheet} / 理由: {reason}）")
                     continue
 
-                # ファイル名に「返庫」を含む場合、払出数をマイナス符号で取り込む
                 base_name = xf.name.rsplit(".", 1)[0]
                 qty_sign = -1 if is_henko_from_name(base_name) else 1
 
@@ -543,7 +543,6 @@ if run:
     else:
         st.success(f"合計 {total} 行を抽出しました。")
 
-    # -------- “編集用”追記＋レポート再作成 --------
     try:
         base_bytes = out_book.getvalue() if out_book else None
         updated = update_workbook_with_rows(base_bytes, st.session_state.rows_all, sheet_name="編集用")
@@ -552,7 +551,6 @@ if run:
     except Exception as e:
         st.error(f"Excelの更新に失敗: {e}")
 
-# ===================== プレビュー =====================
 st.markdown("### 抽出結果（先頭300行）")
 if st.session_state.rows_all:
     df_out = pd.DataFrame(st.session_state.rows_all, columns=HEADERS)[:300]
@@ -567,3 +565,4 @@ if st.session_state.updated_excel_bytes:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
+
