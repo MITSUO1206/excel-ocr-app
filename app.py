@@ -510,7 +510,7 @@ with st.sidebar:
             else:
                 st.error(f"❌ 連携NG：{msg}")
 
-st.markdown("### 1) 入力ファイル（Excel／複数可、★1回につき最大8ファイルまで）")
+st.markdown("### 1) 入力ファイル（Excel／複数可）")
 xlsx_inputs = st.file_uploader("Excel（シート自動選択：編集用＞数量の多いシート＞先頭）", type=["xlsx"], accept_multiple_files=True)
 
 st.markdown("### 2) 追記先Excel（未指定なら新規作成してDL可）")
